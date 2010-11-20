@@ -316,7 +316,6 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	
-	
 	freenect_set_tilt_degs(f_dev,freenect_angle);
 	freenect_set_led(f_dev,LED_RED);
 	freenect_set_depth_callback(f_dev, depth_cb);

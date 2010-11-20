@@ -163,9 +163,9 @@ void *network_data(void *arg)
 		{
 			int n;
 			int16_t ax,ay,az;
-			freenect_get_raw_accelerometers(f_dev, &ax, &ay, &az);
+			freenect_get_raw_accel(f_dev, &ax, &ay, &az);
 			double dx,dy,dz;
-			freenect_get_mks_accelerometers(f_dev, &dx, &dy, &dz);
+			freenect_get_mks_accel(f_dev, &dx, &dy, &dz);
 			char buffer_send[3*2+3*8];
 			memcpy(&buffer_send,&ax, sizeof(int16_t));
 			memcpy(&buffer_send[2],&ay, sizeof(int16_t));
@@ -299,11 +299,10 @@ void network_close()
 
 uint16_t t_gamma[2048];
 
-void depthimg(freenect_device *dev, freenect_depth *depth, uint32_t timestamp)
+void depth_cb(freenect_device *dev, freenect_depth *depth, uint32_t timestamp)
 {
 	
 	int i, n;
-	int compressed_size;
 	
 	pthread_mutex_lock(&depth_mutex);
 	for (i=0; i<FREENECT_FRAME_PIX; i++) {
@@ -363,7 +362,7 @@ void depthimg(freenect_device *dev, freenect_depth *depth, uint32_t timestamp)
 	pthread_mutex_unlock(&depth_mutex);
 }
 
-void rgbimg(freenect_device *dev, freenect_pixel *rgb, uint32_t timestamp)
+void rgb_cb(freenect_device *dev, freenect_pixel *rgb, uint32_t timestamp)
 {
 	int n;
 	pthread_mutex_lock(&depth_mutex);
@@ -379,11 +378,11 @@ void rgbimg(freenect_device *dev, freenect_pixel *rgb, uint32_t timestamp)
 		buf_rgb[4 * x + 2] = rgb[3 * x + 2];
 		buf_rgb[4 * x + 3] = 0x00;
 	}
-	
+	printf("rgb received\n ");
 	if ( rgb_connected == 1 )
 	{
 		n = write(rgb_child, buf_rgb, AS3_BITMAPDATA_LEN);
-		if ( n < 0 || n != AS3_BITMAPDATA_LEN )
+		if ( n < 0 || n != AS3_BITMAPDATA_LEN)
 		{
 			fprintf(stderr, "Error on write() for rgb (%d instead of %d)\n",n, AS3_BITMAPDATA_LEN);
 			//break;
@@ -395,10 +394,6 @@ void rgbimg(freenect_device *dev, freenect_pixel *rgb, uint32_t timestamp)
 
 int main(int argc, char **argv)
 {
-	//int res;
-	
-	printf("Kinect camera test\n");
-	
 	int i;
 	for (i=0; i<2048; i++) {
 		float v = i/2048.0;
@@ -414,7 +409,19 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	
-	if (freenect_open_device(f_ctx, &f_dev, 0) < 0) {
+	freenect_set_log_level(f_ctx, FREENECT_LOG_DEBUG);
+	
+	int nr_devices = freenect_num_devices (f_ctx);
+	printf ("Number of devices found: %d\n", nr_devices);
+	
+	int user_device_number = 0;
+	if (argc > 1)
+		user_device_number = atoi(argv[1]);
+	
+	if (nr_devices < 1)
+		return 1;
+	
+	if (freenect_open_device(f_ctx, &f_dev, user_device_number) < 0) {
 		printf("Could not open device\n");
 		return 1;
 	}
@@ -422,10 +429,10 @@ int main(int argc, char **argv)
 	if ( network_init() < 0 )
 		return -1;
 	
-	freenect_set_depth_callback(f_dev, depthimg);
-	freenect_set_rgb_callback(f_dev, rgbimg);
+	freenect_set_depth_callback(f_dev, depth_cb);
+	freenect_set_rgb_callback(f_dev, rgb_cb);
 	freenect_set_rgb_format(f_dev, FREENECT_FORMAT_RGB);
-	
+	freenect_set_depth_format(f_dev, FREENECT_FORMAT_11_BIT);
 	
 	//freenect_start_depth(f_dev);
 	//freenect_set_led(f_dev,LED_RED);
@@ -439,7 +446,7 @@ int main(int argc, char **argv)
 				if (buffer[1] == 1) { //MOVE
 					int angle;
 					memcpy(&angle, &buffer[2], sizeof(int));
-					freenect_set_tilt_in_degrees(f_dev,ntohl(angle));
+					freenect_set_tilt_degs(f_dev,ntohl(angle));
 				}
 			}
 		}
