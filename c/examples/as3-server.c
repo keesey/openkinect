@@ -29,7 +29,7 @@
 #include <string.h>
 #include <libusb.h>
 #include "libfreenect.h"
-
+#include <jpeglib.h>
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <signal.h>
@@ -46,8 +46,8 @@ int got_frames = 0;
 
 #define AS3_BITMAPDATA_LEN 640 * 480 * 4
 
-struct sockaddr_in si_depth, si_rgb;
-pthread_t depth_thread, rgb_thread;
+struct sockaddr_in si_depth, si_rgb, si_data;
+pthread_t depth_thread, rgb_thread, data_thread;
 pthread_mutex_t depth_mutex	= PTHREAD_MUTEX_INITIALIZER,
 rgb_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t depth_cond = PTHREAD_COND_INITIALIZER,
@@ -55,26 +55,39 @@ rgb_cond = PTHREAD_COND_INITIALIZER;
 char *conf_ip		= "127.0.0.1";
 int s_depth			= -1,
 s_rgb			= -1,
+s_data			= -1,
 conf_port_depth	= 6001,
-conf_port_rgb	= 6002;
+conf_port_rgb	= 6002,
+conf_port_data	= 6003;
 
 uint8_t buf_depth[AS3_BITMAPDATA_LEN];
 uint8_t	buf_rgb[AS3_BITMAPDATA_LEN];
 
 int die = 0;
+
 int depth_child;
 int depth_connected = 0;
+
 int rgb_child;
 int rgb_connected = 0;
 
+int data_child;
+int data_connected = 0;
+
+
+int psent = 0;
+
 void send_policy_file(int child){
-	int n;
-	char * str = "<?xml version='1.0'?><!DOCTYPE cross-domain-policy SYSTEM '/xml/dtds/cross-domain-policy.dtd'><cross-domain-policy><site-control permitted-cross-domain-policies='all'/><allow-access-from domain='*' to-ports='*'/></cross-domain-policy>\n";
-	n = write(child,str , 237);
-	if ( n < 0 || n != 237)
-	{
-		fprintf(stderr, "Error on write() for depth (%d instead of %d)\n",n, 237);
-		//break;
+	if(psent == 0){
+		int n;
+		char * str = "<?xml version='1.0'?><!DOCTYPE cross-domain-policy SYSTEM '/xml/dtds/cross-domain-policy.dtd'><cross-domain-policy><site-control permitted-cross-domain-policies='all'/><allow-access-from domain='*' to-ports='*'/></cross-domain-policy>\n";
+		n = write(child,str , 237);
+		if ( n < 0 || n != 237)
+		{
+			fprintf(stderr, "Error on write() for depth (%d instead of %d)\n",n, 237);
+			//break;
+		}
+		psent = 1;
 	}
 }
 
@@ -96,8 +109,8 @@ void *network_depth(void *arg)
 		
 		printf("### Got depth client\n");
 		send_policy_file(depth_child);
-		freenect_start_depth(f_dev);
 		depth_connected = 1;
+		freenect_start_depth(f_dev);
 	}
 	
 	return NULL;
@@ -121,8 +134,47 @@ void *network_rgb(void *arg)
 		
 		printf("### Got rgb client\n");
 		send_policy_file(rgb_child);
-		freenect_start_rgb(f_dev);
 		rgb_connected = 1;
+		freenect_start_rgb(f_dev);
+	}
+	
+	return NULL;
+}
+
+void *network_data(void *arg)
+{
+	int childlen;
+	struct sockaddr_in childaddr;
+	
+	childlen = sizeof(childaddr);
+	while ( !die )
+	{
+		printf("### Wait data client\n");
+		data_child = accept(s_data, (struct sockaddr *)&childaddr, (unsigned int *)&childlen);
+		if ( data_child < 0 )
+		{
+			fprintf(stderr, "Error on accept() for data, exit data thread.\n");
+			break;
+		}
+		
+		printf("### Got data client\n");
+		
+		while(!die && freenect_process_events(f_ctx) >= 0 )
+		{
+			int n;
+			int16_t ax,ay,az;
+			freenect_get_raw_accelerometers(f_dev, &ax, &ay, &az);
+			double dx,dy,dz;
+			freenect_get_mks_accelerometers(f_dev, &dx, &dy, &dz);
+			char buffer_send[3*2+3*8];
+			memcpy(&buffer_send,&ax, sizeof(int16_t));
+			memcpy(&buffer_send[2],&ay, sizeof(int16_t));
+			memcpy(&buffer_send[4],&az, sizeof(int16_t));
+			memcpy(&buffer_send[6],&dx, sizeof(double));
+			memcpy(&buffer_send[14],&dy, sizeof(double));
+			memcpy(&buffer_send[22],&dz, sizeof(double));
+			n = write(data_child, buffer_send, 3*2+3*8);
+		}
 	}
 	
 	return NULL;
@@ -146,11 +198,19 @@ int network_init()
 		return -1;
 	}
 	
+	if ( (s_data = socket(AF_INET, SOCK_STREAM, 0)) == -1 )
+	{
+		fprintf(stderr, "Unable to create data socket\n");
+		return -1;
+	}
+	
 	setsockopt(s_depth, SOL_SOCKET, SO_REUSEADDR, (const void *)&optval, sizeof(optval));
 	setsockopt(s_rgb, SOL_SOCKET, SO_REUSEADDR, (const void *)&optval, sizeof(optval));
+	setsockopt(s_data, SOL_SOCKET, SO_REUSEADDR, (const void *)&optval, sizeof(optval));
 	
 	memset((char *) &si_depth, 0, sizeof(si_depth));
 	memset((char *) &si_rgb, 0, sizeof(si_rgb));
+	memset((char *) &si_data, 0, sizeof(si_data));
 	
 	si_depth.sin_family			= AF_INET;
 	si_depth.sin_port			= htons(conf_port_depth);
@@ -159,6 +219,10 @@ int network_init()
 	si_rgb.sin_family			= AF_INET;
 	si_rgb.sin_port				= htons(conf_port_rgb);
 	si_rgb.sin_addr.s_addr		= inet_addr(conf_ip);
+	
+	si_data.sin_family			= AF_INET;
+	si_data.sin_port			= htons(conf_port_data);
+	si_data.sin_addr.s_addr		= inet_addr(conf_ip);
 	
 	if ( bind(s_depth, (struct sockaddr *)&si_depth,
 			  sizeof(si_depth)) < 0 )
@@ -174,6 +238,13 @@ int network_init()
 		return -1;
 	}
 	
+	if ( bind(s_data, (struct sockaddr *)&si_data,
+			  sizeof(si_data)) < 0 )
+	{
+		fprintf(stderr, "Error at bind() for data\n");
+		return -1;
+	}
+	
 	if ( listen(s_depth, 1) < 0 )
 	{
 		fprintf(stderr, "Error on listen() for depth\n");
@@ -186,7 +257,13 @@ int network_init()
 		return -1;
 	}
 	
-	/* launch 2 thread for each images
+	if ( listen(s_data, 1) < 0 )
+	{
+		fprintf(stderr, "Error on listen() for data\n");
+		return -1;
+	}
+	
+	/* launch 3 threads, 2 for each images and 1 for control
 	 */
 	
 	if ( pthread_create(&depth_thread, NULL, network_depth, NULL) )
@@ -200,6 +277,13 @@ int network_init()
 		fprintf(stderr, "Error on pthread_create() for rgb\n");
 		return -1;
 	}
+	
+	if ( pthread_create(&data_thread, NULL, network_data, NULL) )
+	{
+		fprintf(stderr, "Error on pthread_create() for data\n");
+		return -1;
+	}
+	
 	
 	return 0;
 }
@@ -217,7 +301,9 @@ uint16_t t_gamma[2048];
 
 void depthimg(freenect_device *dev, freenect_depth *depth, uint32_t timestamp)
 {
+	
 	int i, n;
+	int compressed_size;
 	
 	pthread_mutex_lock(&depth_mutex);
 	for (i=0; i<FREENECT_FRAME_PIX; i++) {
@@ -225,49 +311,49 @@ void depthimg(freenect_device *dev, freenect_depth *depth, uint32_t timestamp)
 		int lb = pval & 0xff;
 		switch (pval>>8) {
 			case 0:
-				buf_depth[4 * i + 0] = 255;
-				buf_depth[4 * i + 1] = 255-lb;
-				buf_depth[4 * i + 2] = 255-lb;
+				buf_depth[4 *  i + 0] = 255;
+				buf_depth[4 *  i + 1] = 255-lb;
+				buf_depth[4 *  i + 2] = 255-lb;
 				break;
 			case 1:
-				buf_depth[4 * i + 0] = 255;
-				buf_depth[4 * i + 1] = lb;
-				buf_depth[4 * i + 2] = 0;
+				buf_depth[4 *  i + 0] = 255;
+				buf_depth[4 *  i + 1] = lb;
+				buf_depth[4 *  i + 2] = 0;
 				break;
 			case 2:
-				buf_depth[4 * i + 0] = 255-lb;
-				buf_depth[4 * i + 1] = 255;
-				buf_depth[4 * i + 2] = 0;
+				buf_depth[4 *  i + 0] = 255-lb;
+				buf_depth[4 *  i + 1] = 255;
+				buf_depth[4 *  i + 2] = 0;
 				break;
 			case 3:
-				buf_depth[4 * i + 0] = 0;
-				buf_depth[4 * i + 1] = 255;
-				buf_depth[4 * i + 2] = lb;
+				buf_depth[4 *  i + 0] = 0;
+				buf_depth[4 *  i + 1] = 255;
+				buf_depth[4 *  i + 2] = lb;
 				break;
 			case 4:
-				buf_depth[4 * i + 0] = 0;
-				buf_depth[4 * i + 1] = 255-lb;
-				buf_depth[4 * i + 2] = 255;
+				buf_depth[4 *  i + 0] = 0;
+				buf_depth[4 *  i + 1] = 255-lb;
+				buf_depth[4 *  i + 2] = 255;
 				break;
 			case 5:
-				buf_depth[4 * i + 0] = 0;
-				buf_depth[4 * i + 1] = 0;
-				buf_depth[4 * i + 2] = 255-lb;
+				buf_depth[4 *  i + 0] = 0;
+				buf_depth[4 *  i + 1] = 0;
+				buf_depth[4 *  i + 2] = 255-lb;
 				break;
 			default:
-				buf_depth[4 * i + 0] = 0;
-				buf_depth[4 * i + 1] = 0;
-				buf_depth[4 * i + 2] = 0;
+				buf_depth[4 *  i + 0] = 0;
+				buf_depth[4 *  i + 1] = 0;
+				buf_depth[4 *  i + 2] = 0;
 				break;
 		}
-		buf_depth[4 * i + 3] = 0x00;
+		buf_depth[4 *  i + 3] = 0x00;
 	}
 	got_frames++;
-
+	 
 	if ( depth_connected == 1 )
-	{
+	{	
 		n = write(depth_child, buf_depth, AS3_BITMAPDATA_LEN);
-		if ( n < 0 || n != AS3_BITMAPDATA_LEN )
+		if ( n < 0 || n != AS3_BITMAPDATA_LEN)
 		{
 			fprintf(stderr, "Error on write() for depth (%d instead of %d)\n",n, AS3_BITMAPDATA_LEN);
 			//break;
@@ -283,12 +369,15 @@ void rgbimg(freenect_device *dev, freenect_pixel *rgb, uint32_t timestamp)
 	pthread_mutex_lock(&depth_mutex);
 	got_frames++;
 	//memcpy(buf_rgb, rgb, FREENECT_RGB_SIZE);
+	//unsigned char * tmp_depth;
+	//int compressed_size = SaveJPGToBuffer(tmp_depth, 75, 640, 480, rgb, 640*480);
+	//printf("size: %d", compressed_size);
 	int x;
 	for (x=0; x<640 * 480; x++) {
-				buf_rgb[4 * x + 0] = rgb[3 * x + 0];
-				buf_rgb[4 * x + 1] = rgb[3 * x + 1];
-				buf_rgb[4 * x + 2] = rgb[3 * x + 2];
-				buf_rgb[4 * x + 3] = 0x00;
+		buf_rgb[4 * x + 0] = rgb[3 * x + 0];
+		buf_rgb[4 * x + 1] = rgb[3 * x + 1];
+		buf_rgb[4 * x + 2] = rgb[3 * x + 2];
+		buf_rgb[4 * x + 3] = 0x00;
 	}
 	
 	if ( rgb_connected == 1 )
@@ -300,7 +389,6 @@ void rgbimg(freenect_device *dev, freenect_pixel *rgb, uint32_t timestamp)
 			//break;
 		}
 	}
-	
 	pthread_cond_signal(&depth_cond);
 	pthread_mutex_unlock(&depth_mutex);
 }
@@ -338,16 +426,24 @@ int main(int argc, char **argv)
 	freenect_set_rgb_callback(f_dev, rgbimg);
 	freenect_set_rgb_format(f_dev, FREENECT_FORMAT_RGB);
 	
-	//res = pthread_create(&gl_thread, NULL, gl_threadfunc, NULL);
-	//if (res) {
-	//	printf("pthread_create failed\n");
-	//	return 1;
-	//}
 	
 	//freenect_start_depth(f_dev);
-	//freenect_start_rgb(f_dev);
+	//freenect_set_led(f_dev,LED_RED);
 	
-	while(!die && freenect_process_events(f_ctx) >= 0 );
+	while(!die && freenect_process_events(f_ctx) >= 0 ){
+		char buffer[6];
+		int n = read(data_child, buffer, 1024);
+		//printf("n: %d\n", n);
+		if(n == 6){
+			if (buffer[0] == 1) { //MOTOR
+				if (buffer[1] == 1) { //MOVE
+					int angle;
+					memcpy(&angle, &buffer[2], sizeof(int));
+					freenect_set_tilt_in_degrees(f_dev,ntohl(angle));
+				}
+			}
+		}
+	}
 	
 	network_close();
 	
